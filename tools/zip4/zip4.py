@@ -4,7 +4,16 @@
 Batch: read a CSV, look up each row's address, write a copy with ZIP+4 columns added.
 
     zip4.py csv addresses.csv --street-col "Address" --city-col "City" \\
-        --state-col "State" --zip-col "Zip" [-o out.csv] [--cache zip4-cache.json]
+        --state-col "State" --zip-col "Zip" [-o out.csv] [--cluster-digits 2] [--rate-per-hour 60]
+
+--cluster-digits N (0-4) adds a zip_cluster column holding the ZIP plus only the first N digits
+of the +4 (e.g. 98101-12 for N=2), for grouping addresses at a coarser level. The full ZIP+4 is
+always kept as well, so the grouping can be changed later without new USPS lookups.
+
+USPS limits each app to a number of requests per hour. Lookups are paced to --rate-per-hour
+(default 60), results are cached next to the input, and if the quota still runs out the run
+stops cleanly: rows not yet looked up are marked "pending" and rerunning the same command
+resumes from the cache.
 
 Single address:
 
@@ -30,16 +39,24 @@ from dataclasses import dataclass
 from pathlib import Path
 
 DEFAULT_BASE_URL = "https://apis.usps.com"
+DEFAULT_RATE_PER_HOUR = 60.0  # USPS's default quota for a new app; raise it if USPS grants more
+MAX_RETRY_WAIT = 3600.0  # quotas are hourly, so never wait longer than that for one retry
 USER_AGENT = "TeneoGroupLLC-DataAnalysisTools-zip4/1.0"
 
 # Columns appended to the output CSV.
 OUT_COLUMNS = ("zip4", "zip_plus4", "zip4_status", "zip4_message")
+CLUSTER_COLUMN = "zip_cluster"  # added only with --cluster-digits
 
 # Status values written to zip4_status.
 MATCHED = "matched"
 NOT_FOUND = "not_found"
 INVALID = "invalid_input"
 ERROR = "error"
+PENDING = "pending"  # not looked up because the USPS quota ran out; rerun to finish
+
+
+class QuotaExceeded(Exception):
+    """USPS kept answering 429 after waiting and retrying."""
 
 
 @dataclass(frozen=True)
@@ -66,6 +83,16 @@ class Result:
     @property
     def zip_plus4(self) -> str:
         return f"{self.zip5}-{self.zip4}" if self.zip5 and self.zip4 else ""
+
+    def cluster(self, digits: int) -> str:
+        """ZIP plus the first `digits` digits of the +4 (0 = ZIP only); empty unless matched.
+
+        The first two +4 digits are the USPS sector (a few blocks), the last two the segment
+        (about one side of a block or one building).
+        """
+        if self.status != MATCHED or not self.zip5:
+            return ""
+        return f"{self.zip5}-{self.zip4[:digits]}" if digits > 0 else self.zip5
 
     def to_json(self) -> dict:
         return {"status": self.status, "zip5": self.zip5, "zip4": self.zip4, "message": self.message}
@@ -98,14 +125,24 @@ class USPSClient:
     """Minimal client for the USPS Addresses API v3 (OAuth client credentials)."""
 
     def __init__(self, client_id: str, client_secret: str, base_url: str = DEFAULT_BASE_URL,
-                 max_retries: int = 5, timeout: float = 30.0):
+                 max_retries: int = 5, timeout: float = 30.0, rate_per_hour: float = DEFAULT_RATE_PER_HOUR):
         self.client_id = client_id
         self.client_secret = client_secret
         self.base_url = base_url.rstrip("/")
         self.max_retries = max_retries
         self.timeout = timeout
+        self.min_interval = 3600.0 / rate_per_hour if rate_per_hour > 0 else 0.0
+        self._last_call: float | None = None
         self._token = ""
         self._token_expires = 0.0
+
+    def _throttle(self) -> None:
+        """Space address requests at least min_interval seconds apart."""
+        if self.min_interval and self._last_call is not None:
+            wait = self._last_call + self.min_interval - time.monotonic()
+            if wait > 0:
+                time.sleep(wait)
+        self._last_call = time.monotonic()
 
     def _request(self, req: urllib.request.Request) -> tuple[int, dict, dict]:
         """Send a request; return (status, json body, headers). HTTP errors are returned, not raised."""
@@ -154,6 +191,7 @@ class USPSClient:
         url = f"{self.base_url}/addresses/v3/address?{urllib.parse.urlencode(params)}"
 
         for attempt in range(self.max_retries + 1):
+            self._throttle()
             req = urllib.request.Request(url, headers={
                 "Authorization": f"Bearer {self._get_token()}",
                 "Accept": "application/json",
@@ -170,7 +208,14 @@ class USPSClient:
             if status == 401 and attempt < self.max_retries:
                 self._token = ""  # expired token: fetch a new one and retry
                 continue
-            if status in (429, 500, 502, 503, 504) and attempt < self.max_retries:
+            if status == 429:
+                if attempt == self.max_retries:
+                    raise QuotaExceeded(error_message(body))
+                wait = retry_after(headers, attempt)
+                print(f"zip4: USPS rate limit (HTTP 429), waiting {wait:.0f}s before retrying", file=sys.stderr)
+                time.sleep(wait)
+                continue
+            if status in (500, 502, 503, 504) and attempt < self.max_retries:
                 wait = retry_after(headers, attempt)
                 print(f"zip4: HTTP {status} from USPS, waiting {wait:.0f}s before retrying", file=sys.stderr)
                 time.sleep(wait)
@@ -185,7 +230,7 @@ def retry_after(headers: dict, attempt: int) -> float:
     for k, v in headers.items():
         if k.lower() == "retry-after":
             try:
-                return max(1.0, float(v))
+                return min(MAX_RETRY_WAIT, max(1.0, float(v)))
             except ValueError:
                 break
     return min(300.0, 5.0 * 2 ** attempt)
@@ -231,7 +276,7 @@ class Cache:
 
 
 def process_csv(in_path: Path, out_path: Path, cols: dict[str, str | None], client: USPSClient,
-                cache: Cache, save_every: int = 25) -> dict[str, int]:
+                cache: Cache, save_every: int = 25, cluster_digits: int | None = None) -> dict[str, int]:
     with in_path.open(newline="", encoding="utf-8-sig") as f:
         reader = csv.DictReader(f)
         fieldnames = list(reader.fieldnames or [])
@@ -241,7 +286,8 @@ def process_csv(in_path: Path, out_path: Path, cols: dict[str, str | None], clie
     if missing:
         raise SystemExit(f"zip4: column(s) not in {in_path.name}: {', '.join(missing)}\n"
                          f"zip4: available columns: {', '.join(fieldnames)}")
-    clash = [c for c in OUT_COLUMNS if c in fieldnames]
+    out_columns = list(OUT_COLUMNS) + ([CLUSTER_COLUMN] if cluster_digits is not None else [])
+    clash = [c for c in out_columns if c in fieldnames]
     if clash:
         raise SystemExit(f"zip4: input already has output column(s): {', '.join(clash)}")
 
@@ -249,47 +295,82 @@ def process_csv(in_path: Path, out_path: Path, cols: dict[str, str | None], clie
         name = cols.get(which)
         return (row.get(name) or "") if name else ""
 
+    addrs = [Address(street=val(row, "street"), city=val(row, "city"), state=val(row, "state"),
+                     zip5=clean_zip5(val(row, "zip")), secondary=val(row, "secondary")) for row in rows]
+    todo = {a.key() for a in addrs if validate(a) is None and cache.get(a.key()) is None}
+    interval = getattr(client, "min_interval", 0.0)
+    if todo:
+        eta = f", about {len(todo) * interval / 3600:.1f} h at the current rate" if interval else ""
+        print(f"zip4: {len(rows)} rows, {len(todo)} new addresses to look up{eta}", file=sys.stderr)
+
     counts: dict[str, int] = {}
     seen: dict[str, Result] = {}
     lookups = 0
-    for i, row in enumerate(rows, 1):
-        addr = Address(street=val(row, "street"), city=val(row, "city"), state=val(row, "state"),
-                       zip5=clean_zip5(val(row, "zip")), secondary=val(row, "secondary"))
+    quota_hit = ""
+    for i, (row, addr) in enumerate(zip(rows, addrs), 1):
         key = addr.key()
         result = seen.get(key) or cache.get(key)
+        if result is None and (reason := validate(addr)):
+            result = Result(INVALID, message=reason)  # needs no USPS call, so never pending
+        if result is None and quota_hit:
+            result = Result(PENDING, message="not looked up yet (USPS quota); rerun to finish")
         if result is None:
-            result = client.lookup(addr)
-            cache.put(key, result)
-            lookups += 1
-            if lookups % save_every == 0:
-                cache.save()
-        seen[key] = result
+            try:
+                result = client.lookup(addr)
+            except QuotaExceeded as e:
+                quota_hit = str(e) or "rate limit"
+                print(f"zip4: USPS quota exhausted ({quota_hit}); stopping lookups", file=sys.stderr)
+                result = Result(PENDING, message="not looked up yet (USPS quota); rerun to finish")
+            else:
+                cache.put(key, result)
+                lookups += 1
+                if lookups % save_every == 0:
+                    cache.save()
+        if result.status != PENDING:
+            seen[key] = result
         row.update(zip4=result.zip4, zip_plus4=result.zip_plus4, zip4_status=result.status,
                    zip4_message=result.message)
+        if cluster_digits is not None:
+            row[CLUSTER_COLUMN] = result.cluster(cluster_digits)
         counts[result.status] = counts.get(result.status, 0) + 1
         if i % 50 == 0:
             print(f"zip4: {i}/{len(rows)} rows", file=sys.stderr)
     cache.save()
 
     with out_path.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames + list(OUT_COLUMNS))
+        writer = csv.DictWriter(f, fieldnames=fieldnames + out_columns)
         writer.writeheader()
         writer.writerows(rows)
     counts["usps_lookups"] = lookups
+    if quota_hit:
+        print("zip4: rerun the same command later to look up the pending rows", file=sys.stderr)
     return counts
+
+
+def cluster_digits_arg(value: str) -> int:
+    try:
+        n = int(value)
+    except ValueError:
+        n = -1
+    if not 0 <= n <= 4:
+        raise argparse.ArgumentTypeError(f"must be 0-4, got {value!r}")
+    return n
 
 
 def make_client(args: argparse.Namespace) -> USPSClient:
     cid, secret = os.environ.get("USPS_CLIENT_ID"), os.environ.get("USPS_CLIENT_SECRET")
     if not cid or not secret:
         raise SystemExit("zip4: set USPS_CLIENT_ID and USPS_CLIENT_SECRET (see tools/zip4/README.md)")
-    return USPSClient(cid, secret, base_url=args.base_url)
+    return USPSClient(cid, secret, base_url=args.base_url, rate_per_hour=args.rate_per_hour)
 
 
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description="Add ZIP+4 codes to addresses using the USPS Addresses API.")
     p.add_argument("--base-url", default=os.environ.get("USPS_BASE_URL", DEFAULT_BASE_URL),
                    help="USPS API base URL (default: %(default)s; testing: https://apis-tem.usps.com)")
+    p.add_argument("--rate-per-hour", type=float,
+                   default=float(os.environ.get("USPS_RATE_PER_HOUR", DEFAULT_RATE_PER_HOUR)),
+                   help="max USPS address lookups per hour, spaced evenly; 0 = no pacing (default: %(default)g)")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     c = sub.add_parser("csv", help="add ZIP+4 columns to a CSV")
@@ -300,7 +381,12 @@ def main(argv: list[str] | None = None) -> int:
     c.add_argument("--state-col", required=True, help="column with the state")
     c.add_argument("--zip-col", help="column with the ZIP code")
     c.add_argument("--secondary-col", help="column with apartment/suite/unit, if separate")
-    c.add_argument("--cache", type=Path, help="JSON cache file; reruns skip addresses already looked up")
+    c.add_argument("--cache", type=Path,
+                   help="JSON cache of results; reruns skip addresses already looked up "
+                        "(default: <input>_zip4-cache.json)")
+    c.add_argument("--no-cache", action="store_true", help="do not read or write a cache file")
+    c.add_argument("--cluster-digits", type=cluster_digits_arg, metavar="N",
+                   help="also add zip_cluster: ZIP plus the first N (0-4) digits of the +4")
 
     s = sub.add_parser("lookup", help="look up a single address")
     s.add_argument("--street", required=True)
@@ -308,15 +394,22 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--city", default="")
     s.add_argument("--state", required=True)
     s.add_argument("--zip", default="")
+    s.add_argument("--cluster-digits", type=cluster_digits_arg, metavar="N",
+                   help="also print zip_cluster: ZIP plus the first N (0-4) digits of the +4")
 
     args = p.parse_args(argv)
 
     if args.cmd == "lookup":
         addr = Address(args.street, args.city, args.state, clean_zip5(args.zip), args.secondary)
         r = make_client(args).lookup(addr)
-        print(json.dumps({**r.to_json(), "zip_plus4": r.zip_plus4}, indent=2))
+        out = {**r.to_json(), "zip_plus4": r.zip_plus4}
+        if args.cluster_digits is not None:
+            out[CLUSTER_COLUMN] = r.cluster(args.cluster_digits)
+        print(json.dumps(out, indent=2))
         return 0 if r.status == MATCHED else 1
 
+    if args.rate_per_hour < 0:
+        p.error("--rate-per-hour must be 0 or more")
     if not args.city_col and not args.zip_col:
         p.error("csv needs --city-col or --zip-col (USPS requires a city or ZIP)")
     out = args.output or args.input.with_name(f"{args.input.stem}_zip4.csv")
@@ -324,10 +417,13 @@ def main(argv: list[str] | None = None) -> int:
         p.error("output would overwrite the input")
     cols = {"street": args.street_col, "city": args.city_col, "state": args.state_col,
             "zip": args.zip_col, "secondary": args.secondary_col}
-    counts = process_csv(args.input, out, cols, make_client(args), Cache(args.cache))
+    cache_path = None if args.no_cache else (
+        args.cache or args.input.with_name(f"{args.input.stem}_zip4-cache.json"))
+    counts = process_csv(args.input, out, cols, make_client(args), Cache(cache_path),
+                         cluster_digits=args.cluster_digits)
     summary = ", ".join(f"{k}={v}" for k, v in sorted(counts.items()))
     print(f"zip4: wrote {out} ({summary})", file=sys.stderr)
-    return 0
+    return 3 if counts.get(PENDING) else 0
 
 
 if __name__ == "__main__":
