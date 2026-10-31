@@ -129,11 +129,13 @@ class USPSClient:
         self.client_id = client_id
         self.client_secret = client_secret
         self.base_url = base_url.rstrip("/")
+        if urllib.parse.urlsplit(self.base_url).scheme != "https":
+            raise ValueError(f"USPS base URL must start with https://, got {base_url!r}")
         self.max_retries = max_retries
         self.timeout = timeout
         self.min_interval = 3600.0 / rate_per_hour if rate_per_hour > 0 else 0.0
         self._last_call: float | None = None
-        self._token = ""
+        self._token = ""  # empty = no token yet; not a password  # nosec B105
         self._token_expires = 0.0
 
     def _throttle(self) -> None:
@@ -147,7 +149,8 @@ class USPSClient:
     def _request(self, req: urllib.request.Request) -> tuple[int, dict, dict]:
         """Send a request; return (status, json body, headers). HTTP errors are returned, not raised."""
         try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+            # Bandit B310 (file:// etc.): the URL is built from base_url, and __init__ requires https.
+            with urllib.request.urlopen(req, timeout=self.timeout) as resp:  # nosec B310
                 return resp.status, json.loads(resp.read() or b"{}"), dict(resp.headers)
         except urllib.error.HTTPError as e:
             raw = e.read()
@@ -206,7 +209,7 @@ class USPSClient:
                     return Result(NOT_FOUND, zip5=zip5, message="USPS returned no ZIP+4 for this address")
                 return Result(MATCHED, zip5=zip5, zip4=zip4, message=match_text(body))
             if status == 401 and attempt < self.max_retries:
-                self._token = ""  # expired token: fetch a new one and retry
+                self._token = ""  # expired token: fetch a new one and retry  # nosec B105
                 continue
             if status == 429:
                 if attempt == self.max_retries:
@@ -223,7 +226,8 @@ class USPSClient:
             if status in (400, 404):
                 return Result(NOT_FOUND, message=error_message(body))
             return Result(ERROR, message=f"HTTP {status}: {error_message(body)}")
-        return Result(ERROR, message="gave up after retries")
+        # Unreachable: the last attempt always returns or raises above. Kept as a safe default.
+        return Result(ERROR, message="gave up after retries")  # pragma: no mutate
 
 
 def retry_after(headers: dict, attempt: int) -> float:
@@ -307,7 +311,7 @@ def process_csv(in_path: Path, out_path: Path, cols: dict[str, str | None], clie
     seen: dict[str, Result] = {}
     lookups = 0
     quota_hit = ""
-    for i, (row, addr) in enumerate(zip(rows, addrs), 1):
+    for i, (row, addr) in enumerate(zip(rows, addrs, strict=True), 1):
         key = addr.key()
         result = seen.get(key) or cache.get(key)
         if result is None and (reason := validate(addr)):
@@ -364,7 +368,7 @@ def make_client(args: argparse.Namespace) -> USPSClient:
     return USPSClient(cid, secret, base_url=args.base_url, rate_per_hour=args.rate_per_hour)
 
 
-def main(argv: list[str] | None = None) -> int:
+def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Add ZIP+4 codes to addresses using the USPS Addresses API.")
     p.add_argument("--base-url", default=os.environ.get("USPS_BASE_URL", DEFAULT_BASE_URL),
                    help="USPS API base URL (default: %(default)s; testing: https://apis-tem.usps.com)")
@@ -396,8 +400,14 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--zip", default="")
     s.add_argument("--cluster-digits", type=cluster_digits_arg, metavar="N",
                    help="also print zip_cluster: ZIP plus the first N (0-4) digits of the +4")
+    return p
 
+
+def main(argv: list[str] | None = None) -> int:
+    p = build_parser()
     args = p.parse_args(argv)
+    if urllib.parse.urlsplit(args.base_url).scheme != "https":
+        p.error(f"--base-url must start with https://, got {args.base_url!r}")
 
     if args.cmd == "lookup":
         addr = Address(args.street, args.city, args.state, clean_zip5(args.zip), args.secondary)

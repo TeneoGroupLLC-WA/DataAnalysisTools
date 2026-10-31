@@ -88,7 +88,7 @@ class Result:
 
     def geoid(self, level: str) -> str:
         """GEOID for a Census level: county 5 digits, tract 11, block group 12, block 15."""
-        if self.status != MATCHED or not (self.state_fips and self.county_fips):
+        if self.status != MATCHED:
             return ""
         parts = {
             "county": (self.state_fips, self.county_fips),
@@ -140,7 +140,7 @@ def parse_response(text: str) -> dict[str, Result]:
         rid, match = row[0], row[2].strip().lower()
         if match == "match" and len(row) >= 6:
             lon, _, lat = row[5].partition(",")
-            fips = (row[8:12] + ["", "", "", ""])[:4]
+            fips = [*row[8:12], "", "", "", ""][:4]
             results[rid] = Result(
                 MATCHED, match_type=row[3].strip().lower(), matched_address=row[4].strip(),
                 latitude=lat.strip(), longitude=lon.strip(), state_fips=fips[0].strip(),
@@ -165,6 +165,8 @@ def batch_csv(items: list[tuple[str, Address]]) -> bytes:
 class CensusClient:
     def __init__(self, url: str = BATCH_URL, benchmark: str = DEFAULT_BENCHMARK, vintage: str = DEFAULT_VINTAGE,
                  timeout: float = 1800.0, max_retries: int = 3):
+        if not url.lower().startswith("https://"):
+            raise ValueError(f"Census URL must use https://, got {url!r}")
         self.url = url
         self.benchmark = benchmark
         self.vintage = vintage
@@ -182,7 +184,8 @@ class CensusClient:
         req = urllib.request.Request(self.url, data=b"".join(parts), method="POST", headers={
             "Content-Type": f"multipart/form-data; boundary={boundary}", "User-Agent": USER_AGENT,
         })
-        with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+        # Safe: __init__ only accepts https:// URLs, so file:// and other schemes never reach urlopen.
+        with urllib.request.urlopen(req, timeout=self.timeout) as resp:  # nosec B310
             return resp.read().decode("utf-8", "replace")
 
     def geocode_batch(self, addrs: list[Address]) -> list[Result]:
@@ -280,7 +283,7 @@ def process_csv(in_path: Path, out_path: Path, cols: dict[str, str | None], clie
         futures = {pool.submit(client.geocode_batch, [a for _, a in b]): b for b in batches}
         for fut in as_completed(futures):
             batch = futures[fut]
-            for (key, _), result in zip(batch, fut.result()):
+            for (key, _), result in zip(batch, fut.result(), strict=True):
                 results[key] = result
                 cache.put(key, result)
             cache.save()  # after every batch, so an interrupted run loses at most the batches in flight
@@ -289,7 +292,7 @@ def process_csv(in_path: Path, out_path: Path, cols: dict[str, str | None], clie
             print(f"geocode: batch {done}/{len(batches)} done ({matched}/{len(batch)} matched)", file=sys.stderr)
 
     counts: dict[str, int] = {}
-    for row, a in zip(rows, addrs):
+    for row, a in zip(rows, addrs, strict=True):
         r = results[a.key()]
         row.update(r.columns())
         if cluster_level:
@@ -317,7 +320,7 @@ def positive_int(limit: int):
     return parse
 
 
-def main(argv: list[str] | None = None) -> int:
+def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Geocode addresses with the US Census Bureau batch geocoder.")
     p.add_argument("--benchmark", default=DEFAULT_BENCHMARK, help="Census address benchmark (default: %(default)s)")
     p.add_argument("--vintage", default=DEFAULT_VINTAGE, help="Census geography vintage (default: %(default)s)")
@@ -345,7 +348,11 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--city", default="")
     s.add_argument("--state", default="")
     s.add_argument("--zip", default="")
+    return p
 
+
+def main(argv: list[str] | None = None) -> int:
+    p = build_parser()
     args = p.parse_args(argv)
     client = CensusClient(benchmark=args.benchmark, vintage=args.vintage)
 
