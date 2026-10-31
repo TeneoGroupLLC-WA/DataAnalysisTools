@@ -7,7 +7,12 @@ This README will grow as tools are added.
 
 ## Tools
 
-_None yet. Each tool will be listed here with a short description and how to run it._
+Each tool lives in its own folder under `tools/`, with a README covering setup and usage.
+
+| Tool | What it does |
+|---|---|
+| [zip4](tools/zip4/README.md) | Adds ZIP+4 codes to a CSV of addresses (or one address) using the USPS Addresses API. |
+| [geocode](tools/geocode/README.md) | Adds latitude/longitude and Census areas (county, tract, block group, block) to a CSV of addresses, using the free Census Bureau batch geocoder. Suited to large files and geographic clustering. |
 
 ## Repository setup
 
