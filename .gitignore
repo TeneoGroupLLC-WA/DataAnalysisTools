@@ -1,5 +1,82 @@
+# --- Secrets and local config (never commit) ---
 .envrc
 .env
-.DS_Store
+.env.*
+!.env.example
 *.pem
 *.key
+*.p12
+*.pfx
+credentials*.json
+service-account*.json
+*.token
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+.python-version
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+
+# --- Jupyter ---
+.ipynb_checkpoints/
+.jupyter/
+*.nbconvert.ipynb
+
+# --- R ---
+.Rhistory
+.RData
+.Rproj.user/
+.Rdata
+*.Rcheck/
+
+# --- Data and outputs ---
+# Datasets and generated results stay out of git; commit small samples under data/sample/.
+/data/*
+!/data/sample/
+!/data/README.md
+/output/
+/outputs/
+/results/
+/reports/generated/
+*.parquet
+*.feather
+*.h5
+*.hdf5
+*.pkl
+*.pickle
+*.joblib
+*.sqlite
+*.sqlite3
+*.db
+*.duckdb
+*.duckdb.wal
+
+# --- Logs and temp files ---
+*.log
+*.tmp
+*.bak
+*.swp
+*~
+
+# --- Editors and OS ---
+.vscode/
+.idea/
+*.code-workspace
+.DS_Store
+Thumbs.db
+desktop.ini
+~$*
