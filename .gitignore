@@ -85,3 +85,6 @@ htmlcov/
 Thumbs.db
 desktop.ini
 ~$*
+
+# --- Mutation testing (mutmut working copies) ---
+mutants/
