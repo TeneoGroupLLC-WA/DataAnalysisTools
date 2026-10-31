@@ -1,0 +1,4 @@
+# Mutation testing for this tool: run `mutmut run` from this folder (CI: scripts/mutation-gate.sh).
+[tool.mutmut]
+source_paths = ["zip4.py"]
+pytest_add_cli_args_test_selection = ["tests"]
