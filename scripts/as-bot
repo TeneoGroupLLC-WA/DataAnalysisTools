@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# Run a command as the GitHub App bot, failing closed.
+#
+# Usage:  scripts/as-bot git commit -m "..."
+#         scripts/as-bot git push https://github.com/OWNER/REPO.git HEAD:refs/heads/my-branch
+#         scripts/as-bot gh pr create ...
+#
+# Mints a fresh down-scoped token (scripts/gh-app-token.sh --git), verifies the identity really is
+# a bot, and only then execs the command. If anything fails the command is NOT run, so nothing can
+# silently fall back to your own git/gh credentials (which `eval "$(gh-app-token.sh)"` allows when
+# the script is missing or errors). Run it from a checkout that has this script, e.g. a worktree
+# off origin/main; in one that does not, the command simply does not exist and nothing runs.
+#
+# Config: GH_APP_ID / GH_APP_KEY_PATH from the environment, else read from the main checkout's
+# .envrc (only those variables are taken from it).
+# Refuse to run under zsh/sh (e.g. `zsh scripts/x` or `source scripts/x`): these scripts need bash.
+[ -n "${BASH_VERSION:-}" ] || { echo "$0: run this with bash (./$(basename "$0")), not zsh or sh" >&2; exit 2; }
+set -euo pipefail
+
+(($# > 0)) || { echo "usage: scripts/as-bot <command> [args...]" >&2; exit 2; }
+cmd="$*"
+die() { echo "as-bot: $1" >&2; echo "as-bot: NOT running: $cmd" >&2; exit 1; }
+
+here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+
+if [[ -z "${GH_APP_ID:-}" || -z "${GH_APP_KEY_PATH:-}" ]]; then
+  common=$(git -C "$here" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || true
+  envfile="${AS_BOT_ENV:-${common:+$(dirname "$common")/.envrc}}"
+  [[ -f "${envfile:-}" ]] || die "GH_APP_ID/GH_APP_KEY_PATH not set and no .envrc found"
+  eval "$(set -a; . "$envfile" >/dev/null 2>&1
+    for v in GH_APP_ID GH_APP_KEY_PATH GH_APP_REPO; do
+      [[ -n "${!v:-}" ]] && printf 'export %s=%q\n' "$v" "${!v}"
+    done)"
+fi
+
+# Never inherit another identity's token.
+unset GH_TOKEN GITHUB_TOKEN GH_ENTERPRISE_TOKEN GITHUB_ENTERPRISE_TOKEN
+
+out=$("$here/gh-app-token.sh" --git) || die "could not mint a bot token"
+eval "$out"
+
+[[ -n "${GH_TOKEN:-}" ]] || die "no token after minting"
+for v in GIT_AUTHOR_NAME GIT_COMMITTER_NAME; do
+  [[ "${!v:-}" == *"[bot]" ]] || die "$v is '${!v:-}', not a bot"
+done
+
+exec "$@"
