@@ -64,9 +64,11 @@ htmlcov/
 *.db
 *.duckdb
 *.duckdb.wal
-# zip4 outputs and caches contain real addresses
+# Tool outputs and caches contain real addresses
 *_zip4.csv
 *zip4-cache*.json
+*_geocoded.csv
+*geocode-cache*.json
 
 # --- Logs and temp files ---
 *.log
