@@ -1,6 +1,6 @@
 # Dev and CI tools only; the tools under tools/ need nothing beyond the standard library.
 bandit==1.9.4
-coverage==7.17.0
+coverage==7.16.2
 mutmut==3.8.1
 pytest==9.2.0
 ruff==0.17.3
